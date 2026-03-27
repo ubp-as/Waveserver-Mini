@@ -1,148 +1,341 @@
 #include "common.h"
-#include <stdarg.h>
+#include <netinet/in.h>
 #include <stdint.h>
-#include <string.h>
-#include <unistd.h>
 
-#define LOG_FILE "wsmini.log"
-#define MAX_LOG_MSG_SIZE (718)
+#define SERVICE_NAME "conn_mgr"
 
-static char service_name[30] = {0};
+static conn_t conns[MAX_CONNS];
+static int client_socket;
 
-static const char *log_level_str[] = {
-    "DEBUG",
-    "INFO",
-    "WARN",
-    "ERROR"};
-
-void log_init(const char *service)
+void initialize_connections()
 {
-    strncpy(service_name, service, sizeof(service_name) - 1);
+    memset(conns, 0, sizeof(conns));
+    LOG(LOG_INFO, "Initialize connection table");
 }
 
-void log_write(log_level_t level,
-               const char *file,
-               int line,
-               const char *fmt,
-               ...)
+bool get_port_info(uint8_t port_id, port_t *out)
 {
-    char msg[MAX_LOG_MSG_SIZE];
-    char log_line[MAX_LOG_MSG_SIZE + 128];
-    char time_buff[32];
+    udp_message_t req = {0};
+    req.msg_type = MSG_GET_PORT_INFO;
+    req.status = STATUS_REQUEST;
 
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, args);
-    va_end(args);
+    udp_port_cmd_request_t *payload = (udp_port_cmd_request_t *)req.payload;
+    payload->port_id = port_id;
 
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    strftime(time_buff, sizeof(time_buff), "%y-%m-%d %H:%M:%S", t);
-
-    snprintf(log_line, sizeof(log_line),
-             "[%s] [%s] [%s] [%s:%d] %s\n",
-             time_buff,
-             log_level_str[level],
-             (strlen(service_name) == 0) ? "unknown" : service_name,
-             file,
-             line,
-             msg);
-
-    FILE *f = fopen(LOG_FILE, "a");
-    if (f)
+    udp_message_t resp = {0};
+    if (!send_udp_message_and_receive(client_socket, &req, &resp, PORT_MANAGER_UDP))
     {
-        fputs(log_line, f);
-        fclose(f);
-    }
-    else
-    {
-        // can't open log file
-        fprintf(stderr, "[logger] failed to open %s\n", LOG_FILE);
-    }
-}
-
-int create_udp_server(uint16_t udp_port)
-{
-    int socket_desc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (socket_desc < 0)
-    {
-        LOG(LOG_ERROR, "Could not initialize socket");
-        return -1;
-    }
-
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(udp_port);
-    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (bind(socket_desc, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-    {
-        LOG(LOG_ERROR, "Could not bind to socket");
-        close(socket_desc);
-        return -1;
-    }
-
-    return socket_desc;
-}
-
-int create_udp_client()
-{
-    int socket_desc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (socket_desc < 0)
-    {
-        LOG(LOG_ERROR, "Could not initialize socket");
-        return socket_desc;
-    }
-    return socket_desc;
-}
-
-void send_udp_message_one_way(int sock, udp_message_t *msg,
-                              uint16_t dest_port)
-{
-    struct sockaddr_in dest = {0};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(dest_port);
-    dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (sendto(sock, msg, sizeof(udp_message_t), 0,
-               (struct sockaddr *)&dest, sizeof(dest)) < 0)
-    {
-        LOG(LOG_ERROR, "sendto on port %u failed",
-            dest_port);
-    }
-}
-
-bool send_udp_message_and_receive(int sock, udp_message_t *req,
-                                  udp_message_t *resp, uint16_t dest_port)
-{
-    // Build destination address (always localhost)
-    struct sockaddr_in dest = {0};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(dest_port);
-    dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    // Send the request
-    if (sendto(sock, req, sizeof(udp_message_t), 0,
-               (struct sockaddr *)&dest, sizeof(dest)) < 0)
-    {
-        LOG(LOG_ERROR, "sendto on port %u failed", dest_port);
+        LOG(LOG_ERROR, "send/receive failed for port-%d", port_id);
         return false;
     }
 
-    // Wait for reply (will respect SO_RCVTIMEO if set on the socket)
-    if (recvfrom(sock, resp, sizeof(udp_message_t), 0, NULL, NULL) < 0)
+    if (resp.status != STATUS_SUCCESS)
     {
-        LOG(LOG_ERROR, "recvfrom on port %u failed", dest_port);
+        LOG(LOG_ERROR, "port-%d not found", port_id);
         return false;
     }
 
+    memcpy(out, resp.payload, sizeof(port_t));
     return true;
 }
 
-void set_error_msg(udp_message_t *resp, const char *msg)
+conn_t *find_connection_by_name(const char *name)
 {
-    resp->status = STATUS_FAILURE;
-    udp_cmd_reply_t *reply = (udp_cmd_reply_t *)resp->payload;
-    strncpy(reply->error_msg, msg, sizeof(reply->error_msg) - 1);
+    for (int i = 0; i < MAX_CONNS; i++)
+    {
+        if (conns[i].client_port != 0 &&
+            strncmp(conns[i].conn_name, name, MAX_CONN_NAME_CHARACTER) == 0)
+            return &conns[i];
+    }
+    return NULL;
+}
+
+void handle_port_state_change(const udp_message_t *req)
+{
+    const udp_port_state_change_t *payload = (udp_port_state_change_t *)req->payload;
+    uint8_t port_id = payload->port_id;
+
+    if (port_id < 1 || port_id > MAX_PORT_NUM) {
+        LOG(LOG_ERROR, "Port-%d out of range");
+        return;
+    }
+
+    LOG(LOG_INFO, "Port-%d operational_state changed to %s",
+        port_id,
+        payload->operational_state == PORT_UP ? "UP" : "DOWN");
+
+    for (int i = 0; i < MAX_CONNS; i++)
+    {
+        if (conns[i].client_port == 0)
+            continue; // empty slot
+
+        if (conns[i].client_port == port_id || conns[i].line_port == port_id)
+        {
+            if (payload->operational_state == PORT_DOWN)
+            {
+                conns[i].operational_state = CONN_DOWN;
+                LOG(LOG_WARN, "Connection %s DOWN (port-%d went down)", conns[i].conn_name, port_id);
+            }
+            else
+            {
+                // check if the other port is also up
+                uint8_t other_port = (conns[i].client_port == port_id) ? conns[i].line_port : conns[i].client_port;
+                port_t other_port_info = {0};
+                if (get_port_info(other_port, &other_port_info) == false)
+                {
+                    LOG(LOG_ERROR, "handle port up: Could not get info for port-%d, leaving connection %s DOWN",
+                        other_port,
+                        conns[i].conn_name);
+                }
+                else if (other_port_info.operational_state == PORT_UP)
+                {
+                    conns[i].operational_state = CONN_UP;
+                    LOG(LOG_INFO, "Connection %s UP (port-%d recovered, port-%d also UP)",
+                        conns[i].conn_name,
+                        port_id,
+                        other_port);
+                }
+                else
+                {
+                    LOG(LOG_WARN, "Connection %s DOWN (port-%d recovered, but port-%d still DOWN)",
+                        conns[i].conn_name,
+                        port_id,
+                        other_port);
+                }
+            }
+        }
+    }
+}
+
+void handle_lookup_connection(const udp_message_t *req, udp_message_t *resp)
+{
+    const udp_route_lookup_request_t *payload = (const udp_route_lookup_request_t *)req->payload;
+
+    conn_t *conn = NULL;
+    for (int i = 0; i < MAX_CONNS; i++)
+    {
+        if (conns[i].client_port == payload->client_port &&
+            conns[i].line_port == payload->line_port)
+        {
+            conn = &conns[i];
+            break;
+        }
+    }
+
+    if (conn == NULL)
+    {
+        LOG(LOG_WARN, "MSG_LOOKUP_CONNECTION: no connection for client port-%d and line port-%d",
+            payload->client_port,
+            payload->line_port);
+        resp->status = STATUS_FAILURE;
+        return;
+    }
+
+    udp_route_lookup_reply_t *reply = (udp_route_lookup_reply_t *)resp->payload;
+
+    strncpy(reply->conn_name, conn->conn_name, sizeof(reply->conn_name) - 1);
+    reply->operational_state = (uint8_t)conn->operational_state;
+    resp->status = STATUS_SUCCESS;
+
+    LOG(LOG_DEBUG,
+        "MSG_LOOKUP_CONNECTION: client-%d → line-%d via %s operational_state=%s",
+        payload->client_port, conn->line_port, conn->conn_name,
+        conn->operational_state == CONN_UP ? "UP" : "DOWN");
+}
+
+void handle_create_connection(const udp_message_t *req, udp_message_t *resp)
+{
+    const udp_create_conn_request_t *payload = (const udp_create_conn_request_t *)req->payload;
+
+    // Validate name length
+    size_t name_len = strlen(payload->name);
+    if (name_len == 0 || name_len >= MAX_CONN_NAME_CHARACTER) {
+        set_error_msg(resp, "Connection name must be 1-31 characters");
+        return;
+    }
+
+    // Validate port types
+    bool client_valid = (payload->client_port >= 3 && payload->client_port <= 6);
+    bool line_valid   = (payload->line_port >= 1 && payload->line_port <= 2);
+    if (!client_valid || !line_valid) {
+        set_error_msg(resp, "One port must be a client port (3-6) and the other a line port (1-2)");
+        return;
+    }
+
+    // Check for duplicate connection name
+    if (find_connection_by_name(payload->name) != NULL) {
+        set_error_msg(resp, "Connection name already exists");
+        return;
+    }
+
+    // Check client port not already in a connection
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (conns[i].client_port == payload->client_port) {
+            char err[80];
+            snprintf(err, sizeof(err), "Client Port-%d already has a connection",
+                     payload->client_port);
+            set_error_msg(resp, err);
+            return;
+        }
+    }
+
+    // Validate both ports are operationally UP
+    port_t client_info = {0}, line_info = {0};
+    if (!get_port_info(payload->client_port, &client_info)) {
+        set_error_msg(resp, "Could not query client port state");
+        return;
+    }
+    if (client_info.operational_state != PORT_UP) {
+        set_error_msg(resp, "Client port is not operationally UP");
+        return;
+    }
+    if (!get_port_info(payload->line_port, &line_info)) {
+        set_error_msg(resp, "Could not query line port state");
+        return;
+    }
+    if (line_info.operational_state != PORT_UP) {
+        set_error_msg(resp, "Line port is not operationally UP");
+        return;
+    }
+
+    // Find a free slot (client_port == 0 means empty)
+    conn_t *slot = NULL;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (conns[i].client_port == 0) {
+            slot = &conns[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        set_error_msg(resp, "Connection table full (max 4 connections)");
+        return;
+    }
+
+    strncpy(slot->conn_name, payload->name, MAX_CONN_NAME_CHARACTER - 1);
+    slot->conn_name[MAX_CONN_NAME_CHARACTER - 1] = '\0';
+    slot->client_port = payload->client_port;
+    slot->line_port   = payload->line_port;
+    slot->operational_state = CONN_UP;
+
+    LOG(LOG_INFO, "Connection %s created: Client-%d -> Line-%d",
+        slot->conn_name, slot->client_port, slot->line_port);
+    resp->status = STATUS_SUCCESS;
+}
+
+void handle_get_connections(udp_message_t *resp)
+{
+    resp->status = STATUS_SUCCESS;
+
+    udp_get_connections_reply_t *resp_payload = (udp_get_connections_reply_t *)resp->payload;
+    int count = 0;
+
+    for (int i = 0; i < MAX_CONNS; i++)
+    {
+        if (conns[i].line_port > 0 && conns[i].client_port > 0) {
+            resp_payload->all_connections[count].client_port = conns[i].client_port;
+            resp_payload->all_connections[count].line_port = conns[i].line_port;
+            resp_payload->all_connections[count].operational_state = conns[i].operational_state;
+            strncpy(resp_payload->all_connections[count].conn_name, conns[i].conn_name, MAX_CONN_NAME_CHARACTER - 1);
+            count++;
+        }
+    }
+
+    resp_payload->conn_count = count;
+}
+
+void handle_delete_conn(const udp_message_t *req, udp_message_t *resp)
+{
+    const udp_delete_conn_request_t *udp_payload = (const udp_delete_conn_request_t *)req->payload;
+    conn_t *found_conn = find_connection_by_name(udp_payload->name);
+
+    if (found_conn == NULL) {
+        const char *err = "could not find connection with that name";
+        LOG(LOG_ERROR, "%s (name=%s)", err, udp_payload->name);
+        set_error_msg(resp, err);
+        return;
+    }
+
+    found_conn->client_port = 0;
+    found_conn->line_port = 0;
+    found_conn->operational_state = CONN_DOWN;
+    found_conn->conn_name[0] = '\0';
+    resp->status = STATUS_SUCCESS;
+    LOG(LOG_INFO, "deleted connection '%s'", udp_payload->name);
+}
+
+bool dispatch(const udp_message_t *req, udp_message_t *resp)
+{
+    bool send_reply = false;
+    resp->msg_type = req->msg_type;
+
+    switch ((msg_type_t)req->msg_type)
+    {
+    case MSG_PORT_STATE_CHANGE:
+        handle_port_state_change(req);
+        break;
+    case MSG_LOOKUP_CONNECTION:
+        handle_lookup_connection(req, resp);
+        send_reply = true;
+        break;
+    case MSG_CREATE_CONN:
+        handle_create_connection(req, resp);
+        send_reply = true;
+        break;
+    case MSG_GET_CONNECTIONS:
+        handle_get_connections(resp);
+        send_reply = true;
+        break;
+    case MSG_DELETE_CONN:
+        handle_delete_conn(req, resp);
+        send_reply = true;
+        break;
+    default:
+        LOG(LOG_WARN, "Unknown msg_type: %d", req->msg_type);
+        break;
+    }
+
+    return send_reply;
+}
+
+int main()
+{
+    log_init(SERVICE_NAME);
+    initialize_connections();
+
+    int server_socket = create_udp_server(CONN_MANAGER_UDP);
+    if (server_socket < 0)
+    {
+        LOG(LOG_ERROR, "Failed to create server socket - exiting");
+        return 1;
+    }
+
+    client_socket = create_udp_client();
+    if (client_socket < 0)
+    {
+        LOG(LOG_ERROR, "Failed to create client socket - exiting");
+        return 1;
+    }
+
+    while (true)
+    {
+        udp_message_t req = {0};
+        struct sockaddr_in sender = {0};
+        socklen_t sender_len = sizeof(sender);
+
+        ssize_t n = recvfrom(server_socket, &req, sizeof(req), 0, (struct sockaddr *)&sender, &sender_len);
+        if (n < 0)
+        {
+            LOG(LOG_ERROR, "recvfrom failed");
+            continue;
+        }
+
+        udp_message_t resp = {0};
+        if (dispatch(&req, &resp) &&
+            (sendto(server_socket, &resp, sizeof(resp), 0, (struct sockaddr *)&sender, sender_len) < 0))
+        {
+            LOG(LOG_ERROR, "sendto reply failed");
+        }
+    }
+
+    return 0;
 }
