@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -246,18 +247,68 @@ void cmd_show_traffic_stats(void)
  */
 void cmd_show_logs(const char *level_filter, const char *service_filter)
 {
-    // TODO: F5 — Show Logs with Filtering (/3 pts)
-    //
-    // Read the shared log file (see LOG_FILE_PATH in common.h) and print its contents.
-    //
-    // Log lines follow this format:
-    //   [timestamp] [LEVEL] [service] [file:line] message
-    //
-    // Filtering rules:
-    //   - level_filter: if provided, only show lines whose level tag matches (i.e., "ERROR", "WARN", "DEBUG", "INFO"). 
-    //   - service_filter: if provided, only show lines from that service (i.e., "port_mgr", "conn_mgr", "traffic_mgr", "cli")
-    //   - Both filters can be active at the same time, and should be case insensitive
-    //   - If neither filter is set, print everything.
+    FILE *f = fopen(LOG_FILE_PATH, "r");
+    if (!f) {
+        printf("[ERROR] Could not open log file: %s\n", LOG_FILE_PATH);
+        return;
+    }
+
+    // Build uppercase level tag to match e.g. "[INFO]"
+    char level_tag[16] = {0};
+    if (level_filter) {
+        snprintf(level_tag, sizeof(level_tag), "[");
+        int j = 1;
+        for (int i = 0; level_filter[i] && j < (int)sizeof(level_tag) - 2; i++, j++)
+            level_tag[j] = (char)toupper((unsigned char)level_filter[i]);
+        level_tag[j++] = ']';
+        level_tag[j] = '\0';
+    }
+
+    // Build service tag to match e.g. "[port_mgr]"
+    char service_tag[40] = {0};
+    if (service_filter) {
+        snprintf(service_tag, sizeof(service_tag), "[%s]", service_filter);
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        // Check level filter
+        if (level_tag[0] != '\0') {
+            // Case-insensitive search for the level tag in the line
+            // Log format: [timestamp] [LEVEL] [service] ...
+            char line_upper[512];
+            for (int i = 0; line[i]; i++)
+                line_upper[i] = (char)toupper((unsigned char)line[i]);
+            line_upper[strlen(line)] = '\0';
+
+            char tag_upper[16];
+            for (int i = 0; level_tag[i]; i++)
+                tag_upper[i] = (char)toupper((unsigned char)level_tag[i]);
+            tag_upper[strlen(level_tag)] = '\0';
+
+            if (!strstr(line_upper, tag_upper))
+                continue;
+        }
+
+        // Check service filter (case-insensitive)
+        if (service_tag[0] != '\0') {
+            char line_lower[512];
+            char tag_lower[40];
+            for (int i = 0; line[i]; i++)
+                line_lower[i] = (char)tolower((unsigned char)line[i]);
+            line_lower[strlen(line)] = '\0';
+            for (int i = 0; service_tag[i]; i++)
+                tag_lower[i] = (char)tolower((unsigned char)service_tag[i]);
+            tag_lower[strlen(service_tag)] = '\0';
+
+            if (!strstr(line_lower, tag_lower))
+                continue;
+        }
+
+        printf("%s", line);
+    }
+
+    fclose(f);
 }
 
 /**
@@ -373,22 +424,18 @@ void cmd_delete_port(uint8_t port_id)
 
 void cmd_inject_fault(uint8_t port_id)
 {
-    // TODO: F2 — Inject Fault — CLI Side (/8 pts)
-    // On success: print the OK message below.
-    // printf("[OK] Fault injected on Port-%d (%s)\n", port_id, port_id <= 2 ? "line" : "client");
-    // On failure: print the ERROR message below.
-    // printf("[ERROR] Failed to inject fault\n");
-    printf("TODO: F2 — Inject Fault — CLI Side (/8 pts)\n");
+    if (exec_port_cmd(port_id, MSG_INJECT_FAULT, "inject-fault"))
+        printf("[OK] Fault injected on Port-%d (%s)\n", port_id, port_id <= 2 ? "line" : "client");
+    else
+        printf("[ERROR] Failed to inject fault\n");
 }
 
 void cmd_clear_fault(uint8_t port_id)
 {
-    // TODO: F2 — Clear Fault — CLI Side (/8 pts)
-    // On success: print the OK message below.
-    // printf("[OK] Fault cleared on Port-%d (%s)\n", port_id, port_id <= 2 ? "line" : "client");
-    // On failure: print the ERROR message below.
-    // printf("[ERROR] Failed to clear fault\n");
-    printf("TODO: F2 — Clear Fault — CLI Side (/8 pts)\n");
+    if (exec_port_cmd(port_id, MSG_CLEAR_FAULT, "clear-fault"))
+        printf("[OK] Fault cleared on Port-%d (%s)\n", port_id, port_id <= 2 ? "line" : "client");
+    else
+        printf("[ERROR] Failed to clear fault\n");
 }
 
 /**
@@ -417,13 +464,17 @@ void cmd_start_traffic(uint8_t client_port, uint8_t line_port)
  */
 void cmd_stop_traffic(void)
 {
-    // TODO: F4 — Stop Traffic CLI (/2 pts)
-    //
-    // Send a stop-traffic request to the traffic manager.
-    // Print the appropriate message based on the outcome:
-    // printf("[ERROR] Failed to stop traffic\n");
-    // printf("[OK] Traffic generation stopped\n");
-    printf("TODO: F4 — Stop Traffic CLI (/2 pts)\n");
+    udp_message_t req = {0};
+    req.msg_type = MSG_STOP_TRAFFIC;
+    req.status   = STATUS_REQUEST;
+
+    udp_message_t resp = {0};
+    if (!send_and_receive(&req, &resp, TRAFFIC_MGR_UDP) || resp.status != STATUS_SUCCESS)
+    {
+        printf("[ERROR] Failed to stop traffic\n");
+        return;
+    }
+    printf("[OK] Traffic generation stopped\n");
 }
 
 /**
