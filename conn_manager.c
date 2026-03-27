@@ -4,7 +4,6 @@
 
 #define SERVICE_NAME "conn_mgr"
 
-
 static conn_t conns[MAX_CONNS];
 static int client_socket;
 
@@ -149,7 +148,7 @@ void handle_create_connection(const udp_message_t *req, udp_message_t *resp)
     const udp_create_conn_request_t *payload = (const udp_create_conn_request_t *)req->payload;
 
     // Validate name length
-    size_t name_len = strnlen(payload->name, MAX_CONN_NAME_CHARACTER);
+    size_t name_len = strlen(payload->name);
     if (name_len == 0 || name_len >= MAX_CONN_NAME_CHARACTER) {
         set_error_msg(resp, "Connection name must be 1-31 characters");
         return;
@@ -172,9 +171,9 @@ void handle_create_connection(const udp_message_t *req, udp_message_t *resp)
     // Check client port not already in a connection
     for (int i = 0; i < MAX_CONNS; i++) {
         if (conns[i].client_port == payload->client_port) {
-            char err[64];
-            snprintf(err, sizeof(err), "Client Port-%d already has a connection (%s)",
-                     payload->client_port, conns[i].conn_name);
+            char err[80];
+            snprintf(err, sizeof(err), "Client Port-%d already has a connection",
+                     payload->client_port);
             set_error_msg(resp, err);
             return;
         }
