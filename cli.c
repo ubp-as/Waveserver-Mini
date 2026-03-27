@@ -159,7 +159,7 @@ void cmd_show_ports(void)
                (port->type == LINE_PORT) ? "line" : "client",
                (port->admin_enabled) ? "enabled" : "disabled",
                (port->fault_active) ? "yes" : "no",
-               (port->operational_state == PORT_UP) ? "UP" : "DOWN",
+               (port->operational_state == PORT_UP) ? "up" : "down",
                port->rx_frames,
                port->dropped_frames);
     }
@@ -209,7 +209,7 @@ void cmd_show_connections(void)
                conn->conn_name,
                conn->client_port,
                conn->line_port,
-               (conn->operational_state == CONN_UP) ? "UP" : "DOWN");
+               (conn->operational_state == CONN_UP) ? "up" : "down");
     }
     printf("\n");
 }
