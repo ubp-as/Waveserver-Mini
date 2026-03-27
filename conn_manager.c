@@ -4,6 +4,7 @@
 
 #define SERVICE_NAME "conn_mgr"
 
+
 static conn_t conns[MAX_CONNS];
 static int client_socket;
 
