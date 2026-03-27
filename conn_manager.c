@@ -35,7 +35,7 @@ bool get_port_info(uint8_t port_id, port_t *out)
         return false;
     }
 
-    memcpy(out, resp.payload, sizeof(out));
+    memcpy(out, resp.payload, sizeof(port_t));
     return true;
 }
 
@@ -145,14 +145,81 @@ void handle_lookup_connection(const udp_message_t *req, udp_message_t *resp)
 
 void handle_create_connection(const udp_message_t *req, udp_message_t *resp)
 {
-    // TODO: F3 — Create Connection Handler (/5 pts)
-    //
-    // Implement the logic to create a new connection between a line port
-    // and a client port. The request payload tells you the desired name for the connection
-    // and port pair — see common.h for the struct.
-    //
-    // Refer to the HLD for connection creation validation instructions.
-    // Use set_error_msg() to report *why* a create was rejected.
+    const udp_create_conn_request_t *payload = (const udp_create_conn_request_t *)req->payload;
+
+    // Validate name length
+    size_t name_len = strnlen(payload->name, MAX_CONN_NAME_CHARACTER);
+    if (name_len == 0 || name_len >= MAX_CONN_NAME_CHARACTER) {
+        set_error_msg(resp, "Connection name must be 1-31 characters");
+        return;
+    }
+
+    // Validate port types
+    bool client_valid = (payload->client_port >= 3 && payload->client_port <= 6);
+    bool line_valid   = (payload->line_port >= 1 && payload->line_port <= 2);
+    if (!client_valid || !line_valid) {
+        set_error_msg(resp, "One port must be a client port (3-6) and the other a line port (1-2)");
+        return;
+    }
+
+    // Check for duplicate connection name
+    if (find_connection_by_name(payload->name) != NULL) {
+        set_error_msg(resp, "Connection name already exists");
+        return;
+    }
+
+    // Check client port not already in a connection
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (conns[i].client_port == payload->client_port) {
+            char err[64];
+            snprintf(err, sizeof(err), "Client Port-%d already has a connection (%s)",
+                     payload->client_port, conns[i].conn_name);
+            set_error_msg(resp, err);
+            return;
+        }
+    }
+
+    // Validate both ports are operationally UP
+    port_t client_info = {0}, line_info = {0};
+    if (!get_port_info(payload->client_port, &client_info)) {
+        set_error_msg(resp, "Could not query client port state");
+        return;
+    }
+    if (client_info.operational_state != PORT_UP) {
+        set_error_msg(resp, "Client port is not operationally UP");
+        return;
+    }
+    if (!get_port_info(payload->line_port, &line_info)) {
+        set_error_msg(resp, "Could not query line port state");
+        return;
+    }
+    if (line_info.operational_state != PORT_UP) {
+        set_error_msg(resp, "Line port is not operationally UP");
+        return;
+    }
+
+    // Find a free slot (client_port == 0 means empty)
+    conn_t *slot = NULL;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (conns[i].client_port == 0) {
+            slot = &conns[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        set_error_msg(resp, "Connection table full (max 4 connections)");
+        return;
+    }
+
+    strncpy(slot->conn_name, payload->name, MAX_CONN_NAME_CHARACTER - 1);
+    slot->conn_name[MAX_CONN_NAME_CHARACTER - 1] = '\0';
+    slot->client_port = payload->client_port;
+    slot->line_port   = payload->line_port;
+    slot->operational_state = CONN_UP;
+
+    LOG(LOG_INFO, "Connection %s created: Client-%d -> Line-%d",
+        slot->conn_name, slot->client_port, slot->line_port);
+    resp->status = STATUS_SUCCESS;
 }
 
 void handle_get_connections(udp_message_t *resp)
@@ -179,13 +246,12 @@ void handle_get_connections(udp_message_t *resp)
 void handle_delete_conn(const udp_message_t *req, udp_message_t *resp)
 {
     const udp_delete_conn_request_t *udp_payload = (const udp_delete_conn_request_t *)req->payload;
-    resp->status = STATUS_SUCCESS;
-    const char *err = NULL;
     conn_t *found_conn = find_connection_by_name(udp_payload->name);
 
     if (found_conn == NULL) {
-        err = "could not find connection with that name";
+        const char *err = "could not find connection with that name";
         LOG(LOG_ERROR, "%s (name=%s)", err, udp_payload->name);
+        set_error_msg(resp, err);
         return;
     }
 
@@ -193,6 +259,7 @@ void handle_delete_conn(const udp_message_t *req, udp_message_t *resp)
     found_conn->line_port = 0;
     found_conn->operational_state = CONN_DOWN;
     found_conn->conn_name[0] = '\0';
+    resp->status = STATUS_SUCCESS;
     LOG(LOG_INFO, "deleted connection '%s'", udp_payload->name);
 }
 
