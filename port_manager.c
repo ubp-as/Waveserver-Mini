@@ -4,11 +4,7 @@
 
 #define SERVICE_NAME "port_mgr"
 
-// TODO: F2 — Inject & Clear Fault (/8 pts)
-//
-// Implement inject-fault and clear-fault handlers + dispatch wiring.
-// Only support fault injection for ports that are admin-enabled.
-// We do not support this feature for ports that are admin-disabled.
+// TODO: F2 — Inject & Clear Fault (/8 pts) — IMPLEMENTED
 
 static port_t ports[MAX_PORT_NUM];
 static int notify_socket; // used to send to connection mgr
@@ -65,7 +61,7 @@ void notify_port_state(uint8_t port_id)
 
 void recalculate_oper_state(port_t *port) {
     port_state_t prev_state = port->operational_state;
-    port->operational_state = (port->admin_enabled || !port->fault_active) ? PORT_UP : PORT_DOWN;
+    port->operational_state = (port->admin_enabled && !port->fault_active) ? PORT_UP : PORT_DOWN;
     
     if (port->operational_state != prev_state) {
         LOG(LOG_INFO, "port_idx=%d oper_state changed: %s -> %s (admin=%s fault=%s)",
@@ -144,6 +140,38 @@ void handle_delete_port(const udp_message_t *request, udp_message_t *response)
     response->status = STATUS_SUCCESS;
 }
 
+void handle_inject_fault(const udp_message_t *request, udp_message_t *response)
+{
+    port_t *port = get_port_from_request(request, response);
+    if (!port) return;
+
+    if (!port->admin_enabled) {
+        set_error_msg(response, "Cannot inject fault on admin-disabled port");
+        return;
+    }
+
+    port->fault_active = true;
+    recalculate_oper_state(port);
+    LOG(LOG_ERROR, "Port-%d SIGNAL LOSS (fault injected)", port->id);
+    response->status = STATUS_SUCCESS;
+}
+
+void handle_clear_fault(const udp_message_t *request, udp_message_t *response)
+{
+    port_t *port = get_port_from_request(request, response);
+    if (!port) return;
+
+    if (!port->admin_enabled) {
+        set_error_msg(response, "Cannot clear fault on admin-disabled port");
+        return;
+    }
+
+    port->fault_active = false;
+    recalculate_oper_state(port);
+    LOG(LOG_INFO, "Port-%d fault cleared", port->id);
+    response->status = STATUS_SUCCESS;
+}
+
 bool dispatch(const udp_message_t *req, udp_message_t *resp)
 {
     bool send_reply = true;
@@ -162,8 +190,15 @@ bool dispatch(const udp_message_t *req, udp_message_t *resp)
         break;
     case MSG_SET_PORT:
         handle_set_port(req, resp);
+        break;
     case MSG_DELETE_PORT:
         handle_delete_port(req, resp);
+        break;
+    case MSG_INJECT_FAULT:
+        handle_inject_fault(req, resp);
+        break;
+    case MSG_CLEAR_FAULT:
+        handle_clear_fault(req, resp);
         break;
     default:
         LOG(LOG_WARN, "Unknown msg_type: %d", req->msg_type);
