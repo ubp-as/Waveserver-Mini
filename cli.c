@@ -209,7 +209,7 @@ void cmd_show_connections(void)
                conn->conn_name,
                conn->client_port,
                conn->line_port,
-               (conn->operational_state == CONN_UP) ? "up" : "down");
+               (conn->operational_state == CONN_UP) ? "UP" : "DOWN");
     }
     printf("\n");
 }
